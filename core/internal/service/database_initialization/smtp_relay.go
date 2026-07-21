@@ -101,7 +101,7 @@ func cleanupAndIndexRelayDomainMapping(ctx context.Context) error {
 		return gerror.New("Table bm_relay_domain_mapping does not exist")
 	}
 
-	exists, err := g.DB().Model("pg_indexes").Fields("1").
+	exists, err := g.DB().Model("pg_indexes").Fields(gdb.Raw("1")).
 		Where("indexname", "uk_relay_domain").
 		Value()
 	if err != nil {
@@ -125,7 +125,7 @@ func cleanupAndIndexRelayDomainMapping(ctx context.Context) error {
 	}
 
 	_, err = g.DB().Exec(ctx, `
-		CREATE UNIQUE INDEX uk_relay_domain 
+		CREATE UNIQUE INDEX IF NOT EXISTS uk_relay_domain 
 		ON bm_relay_domain_mapping(relay_id, sender_domain)
 	`)
 	if err != nil {
