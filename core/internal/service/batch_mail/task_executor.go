@@ -779,12 +779,12 @@ func (e *TaskExecutor) processRecipientBatch(ctx context.Context, task *entity.E
 
 		// check if recipient is allowed to send with warmup
 		if warmupAssociated, ok := e.ctx.Value("warmupAssociated").(bool); ok && warmupAssociated {
-			if allow, waits, _ := warmup.RateLimiter().Allow(ctx, e.ctx.Value("serverIP").(string), public.GetMailProviderGroup(recipient.Recipient)); !allow {
+			if allow, waits, _ := warmup.RateLimiter().Allow(ctx, e.ctx.Value("serverIP").(string), recipient.Recipient); !allow {
 				if waits > 0 {
 					updates[recipient.Id] = waits * 2
 				}
 				// rate limit exceeded, skip this recipient
-				g.Log().Debug(ctx, "Rate limit exceeded for recipient %d, wait for %d seconds after retry, skipping", recipient.Id, waits)
+				g.Log().Debugf(ctx, "Rate limit exceeded for recipient %d, wait for %d seconds after retry, skipping", recipient.Id, waits)
 				continue
 			}
 		}
@@ -858,11 +858,13 @@ func (e *TaskExecutor) processRecipientBatch(ctx context.Context, task *entity.E
 				"task_id":    0,
 				"recipient":  "",
 				"message_id": "",
+				"is_sent":    0,
 				"sent_time":  curTime + (waits * ((i % 10) + 1)),
 			})
 			i++
 		}
 		_, _ = g.DB().Ctx(ctx).Model("recipient_info").Data(data).OnConflict("id").OnDuplicate(g.Map{
+			"is_sent":   gdb.Raw("excluded.is_sent"),
 			"sent_time": gdb.Raw("excluded.sent_time"),
 		}).Save()
 	}

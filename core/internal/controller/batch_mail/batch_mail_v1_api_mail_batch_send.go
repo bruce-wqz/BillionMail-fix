@@ -1,6 +1,8 @@
 package batch_mail
 
 import (
+	"billionmail-core/api/batch_mail/v1"
+	batchMailService "billionmail-core/internal/service/batch_mail"
 	"billionmail-core/internal/service/contact"
 	"billionmail-core/internal/service/mail_service"
 	"billionmail-core/internal/service/public"
@@ -10,8 +12,6 @@ import (
 
 	"github.com/gogf/gf/v2/errors/gerror"
 	"github.com/gogf/gf/v2/frame/g"
-
-	"billionmail-core/api/batch_mail/v1"
 )
 
 func (c *ControllerV1) ApiMailBatchSend(ctx context.Context, req *v1.ApiMailBatchSendReq) (res *v1.ApiMailBatchSendRes, err error) {
@@ -140,6 +140,8 @@ func (c *ControllerV1) ApiMailBatchSend(ctx context.Context, req *v1.ApiMailBatc
 			return res, nil
 		}
 	}
+
+	batchMailService.TriggerApiMailQueueProcessing()
 
 	res.SetSuccess(public.LangCtx(ctx, "Batch email send request accepted, {} emails queued", len(batchData)))
 	return res, nil

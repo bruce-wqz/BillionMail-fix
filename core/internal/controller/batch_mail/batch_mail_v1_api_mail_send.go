@@ -3,6 +3,7 @@ package batch_mail
 import (
 	"billionmail-core/api/batch_mail/v1"
 	"billionmail-core/internal/model/entity"
+	batchMailService "billionmail-core/internal/service/batch_mail"
 	"billionmail-core/internal/service/contact"
 	"billionmail-core/internal/service/mail_service"
 	"billionmail-core/internal/service/public"
@@ -95,6 +96,8 @@ func (c *ControllerV1) ApiMailSend(ctx context.Context, req *v1.ApiMailSendReq) 
 		res.SetError(gerror.New(public.LangCtx(ctx, "Failed to record email log: {}", err.Error())))
 		return res, nil
 	}
+
+	batchMailService.TriggerApiMailQueueProcessing()
 
 	res.SetSuccess(public.LangCtx(ctx, "Email sent successfully"))
 	return res, nil

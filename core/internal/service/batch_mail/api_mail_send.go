@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/gogf/gf/v2/frame/g"
+	"github.com/gogf/gf/v2/os/gctx"
+	"github.com/google/uuid"
 )
 
 const (
@@ -28,6 +30,20 @@ const (
 	LockKey      = "api_mail_queue_lock"
 	LockTimeout  = 60 * 2 // Lock timeout duration (seconds)
 )
+
+const renewApiMailQueueLockLua = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("EXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+`
+
+const releaseApiMailQueueLockLua = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+`
 
 type ApiMailLog struct {
 	Id        int64
@@ -148,25 +164,49 @@ func (p *WorkerPool) processMail(ctx context.Context, log ApiMailLog) {
 	updateLogStatus(ctx, log.Id, StatusSuccess, "")
 }
 
+func TriggerApiMailQueueProcessing() {
+	go ProcessApiMailQueueWithLock(gctx.New())
+}
+
+func acquireApiMailQueueLock(ctx context.Context, token string) bool {
+	res, err := g.Redis().Do(ctx, "SET", LockKey, token, "EX", LockTimeout, "NX")
+	if err != nil {
+		g.Log().Error(ctx, "Failed to acquire API mail queue lock:", err)
+		return false
+	}
+	return strings.EqualFold(res.String(), "OK")
+}
+
+func renewApiMailQueueLock(ctx context.Context, token string) {
+	res, err := g.Redis().Eval(ctx, renewApiMailQueueLockLua, 1, []string{LockKey}, []interface{}{token, LockTimeout})
+	if err != nil {
+		g.Log().Warning(ctx, "Failed to renew API mail queue lock:", err)
+		return
+	}
+	if res.Int() != 1 {
+		g.Log().Debug(ctx, "Skipped API mail queue lock renewal because token does not match")
+	}
+}
+
+func releaseApiMailQueueLock(ctx context.Context, token string) {
+	res, err := g.Redis().Eval(ctx, releaseApiMailQueueLockLua, 1, []string{LockKey}, []interface{}{token})
+	if err != nil {
+		g.Log().Warning(ctx, "Failed to release API mail queue lock:", err)
+		return
+	}
+	if res.Int() != 1 {
+		g.Log().Debug(ctx, "Skipped API mail queue lock release because token does not match")
+	}
+}
+
 // Queue processing with distributed lock
 func ProcessApiMailQueueWithLock(ctx context.Context) {
 	// Attempt to acquire the distributed lock
-	err := g.Redis().SetEX(ctx, LockKey, "1", LockTimeout)
-	if err != nil {
-		g.Log().Error(ctx, "Failed to acquire lock:", err)
+	lockToken := uuid.NewString()
+	if !acquireApiMailQueueLock(ctx, lockToken) {
+		g.Log().Debug(ctx, "Another instance is processing the API mail queue")
 		return
 	}
-	//if !locked {
-	//	g.Log().Warning(ctx, "Another instance is processing the mail queue")
-	//	return
-	//}
-
-	// // Set expiration time
-	// g.Redis().Expire(ctx, LockKey, int64(LockTimeout))
-
-	// defer func() {
-	// 	g.Redis().Del(ctx, LockKey)
-	// }()
 
 	// Start the goroutine for lease renewal
 	stopRenew := make(chan struct{})
@@ -177,7 +217,7 @@ func ProcessApiMailQueueWithLock(ctx context.Context) {
 			select {
 			case <-ticker.C:
 				// Renewal lock
-				g.Redis().Expire(ctx, LockKey, int64(LockTimeout))
+				renewApiMailQueueLock(ctx, lockToken)
 			case <-stopRenew:
 				return
 			}
@@ -186,7 +226,7 @@ func ProcessApiMailQueueWithLock(ctx context.Context) {
 
 	defer func() {
 		close(stopRenew)
-		g.Redis().Del(ctx, LockKey)
+		releaseApiMailQueueLock(ctx, lockToken)
 	}()
 
 	// Process the email queue
