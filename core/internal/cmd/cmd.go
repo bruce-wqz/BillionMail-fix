@@ -109,6 +109,14 @@ func stripWebBasePathMiddleware(basePath string) ghttp.HandlerFunc {
 	}
 }
 
+func isSafePathExcluded(path string, exactPaths map[string]struct{}) bool {
+	if _, ok := exactPaths[path]; ok {
+		return true
+	}
+
+	return strings.HasPrefix(path, "/pmta/")
+}
+
 var (
 	Main = gcmd.Command{
 		Name:  consts.DEFAULT_SERVER_NAME,
@@ -244,7 +252,7 @@ var (
 						}
 
 						// check if the request is in the excluded URIs
-						if _, ok := excludesURIs[r.URL.Path]; ok {
+						if isSafePathExcluded(r.URL.Path, excludesURIs) {
 							return
 						}
 
