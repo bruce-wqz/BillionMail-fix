@@ -34,6 +34,21 @@ func TestIsSafePathExcluded(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "roundcube root without trailing slash",
+			path: "/roundcube",
+			want: true,
+		},
+		{
+			name: "roundcube root with trailing slash",
+			path: "/roundcube/",
+			want: true,
+		},
+		{
+			name: "roundcube child path",
+			path: "/roundcube/index.php",
+			want: true,
+		},
+		{
 			name: "protected backend path",
 			path: "/settings",
 			want: false,

@@ -114,7 +114,9 @@ func isSafePathExcluded(path string, exactPaths map[string]struct{}) bool {
 		return true
 	}
 
-	return strings.HasPrefix(path, "/pmta/")
+	return strings.HasPrefix(path, "/pmta/") ||
+		path == "/roundcube" ||
+		strings.HasPrefix(path, "/roundcube/")
 }
 
 var (
@@ -350,6 +352,10 @@ var (
 			// SPA fallback
 
 			// Add PHP-FPM middleware
+			s.BindHandler("GET:/roundcube", func(r *ghttp.Request) {
+				r.Response.RedirectTo(webBasePath + "/roundcube/")
+			})
+
 			s.BindMiddleware("/roundcube/*any", func(r *ghttp.Request) {
 				if r.Method == "POST" && strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
 					// Get and store the request body
