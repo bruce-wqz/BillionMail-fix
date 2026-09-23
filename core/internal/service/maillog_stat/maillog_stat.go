@@ -278,7 +278,7 @@ func (ms *MaillogStat) parseLogTimeMillis(line string) int64 {
 
 	// Try to parse ISO 8601 format
 	if len(line) >= 4 && isDigit(line[:4]) {
-		t, err := time.Parse(time.RFC3339, strings.Split(line, " ")[0])
+		t, err := time.Parse(time.RFC3339Nano, strings.Split(line, " ")[0])
 		if err == nil {
 			return t.UnixMilli()
 		}
@@ -761,6 +761,8 @@ func (ms *MaillogStat) AnalysisAndSaveToDatabase(ctx context.Context) error {
 		_, err = g.DB().Model("mailstat_message_ids").Batch(5000).InsertIgnore(messageIDRecords)
 		if err != nil {
 			g.Log().Error(context.Background(), err.Error())
+		} else {
+			BackfillTrackingPostfixMessageIDs(context.Background())
 		}
 	}
 
@@ -834,6 +836,30 @@ func (handler *MallogEventHandler) Start() {
 				g.Log().Error(context.Background(), "MallogEventHandler: error analysing maillog", err)
 			}
 		}
+	}
+}
+
+func BackfillTrackingPostfixMessageIDs(ctx context.Context) {
+	if _, err := g.DB().Exec(ctx, `
+UPDATE mailstat_opened AS o
+SET postfix_message_id = mi.postfix_message_id
+FROM mailstat_message_ids AS mi
+WHERE o.postfix_message_id = ''
+  AND o.message_id = mi.message_id
+  AND mi.postfix_message_id <> ''
+`); err != nil {
+		g.Log().Error(ctx, "BackfillTrackingPostfixMessageIDs opened error:", err)
+	}
+
+	if _, err := g.DB().Exec(ctx, `
+UPDATE mailstat_clicked AS c
+SET postfix_message_id = mi.postfix_message_id
+FROM mailstat_message_ids AS mi
+WHERE c.postfix_message_id = ''
+  AND c.message_id = mi.message_id
+  AND mi.postfix_message_id <> ''
+`); err != nil {
+		g.Log().Error(ctx, "BackfillTrackingPostfixMessageIDs clicked error:", err)
 	}
 }
 
