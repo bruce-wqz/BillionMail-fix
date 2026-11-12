@@ -61,7 +61,7 @@ func Start(ctx context.Context) (err error) {
 	// Start maillog analysis
 	gtimer.AddOnce(time.Second, func() {
 		me := maillog_stat.NewMallogEventHandler("", 1*time.Second)
-		me.Start()
+		me.Start(ctx)
 	})
 
 	// Start maillog aggregation

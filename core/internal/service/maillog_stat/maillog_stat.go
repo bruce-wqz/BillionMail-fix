@@ -23,6 +23,20 @@ var (
 	defaultPostfixMainConf = public.AbsPath(consts.POSTFIX_MAIN_CONF)
 )
 
+const defaultMaillogPollInterval = 30 * time.Second
+
+func watchMaillog(path string, notify func()) error {
+	_, err := gfsnotify.Add(filepath.Dir(path), func(event *gfsnotify.Event) {
+		if filepath.Clean(event.Path) != filepath.Clean(path) {
+			return
+		}
+		if event.IsWrite() || event.IsCreate() || event.IsRename() {
+			notify()
+		}
+	})
+	return err
+}
+
 // GetLastMaillogTimeMillis retrieves the last mail log time in milliseconds
 func GetLastMaillogTimeMillis() int64 {
 	val, err := g.DB().Model("bm_options").Where("name", "last_maillog_time_millis").Value("value")
@@ -779,62 +793,89 @@ func (ms *MaillogStat) AnalysisAndSaveToDatabase(ctx context.Context) error {
 
 // MallogEventHandler handles mail log events
 type MallogEventHandler struct {
-	maillogStat *MaillogStat
-	delay       time.Duration
-	timer       *time.Timer
-	isHanding   bool
+	maillogStat  *MaillogStat
+	delay        time.Duration
+	pollInterval time.Duration
+	triggerCh    chan struct{}
+	watch        func(notify func()) error
+	analyze      func(ctx context.Context) error
 }
 
 // NewMallogEventHandler creates a new mail log event handler
 func NewMallogEventHandler(maillogPath string, delay time.Duration) *MallogEventHandler {
-	return &MallogEventHandler{
-		maillogStat: NewMaillogStat(maillogPath, GetLastMaillogTimeMillis(), 0, false),
-		delay:       delay,
-		timer:       time.NewTimer(delay),
-		isHanding:   false,
+	maillogStat := NewMaillogStat(maillogPath, GetLastMaillogTimeMillis(), 0, false)
+	handler := &MallogEventHandler{
+		maillogStat:  maillogStat,
+		delay:        delay,
+		pollInterval: defaultMaillogPollInterval,
+		triggerCh:    make(chan struct{}, 1),
+	}
+	handler.watch = func(notify func()) error {
+		return watchMaillog(maillogStat.maillogPath, notify)
+	}
+	handler.analyze = func(ctx context.Context) error {
+		maillogStat.startTime = GetLastMaillogTimeMillis()
+		return maillogStat.AnalysisAndSaveToDatabase(ctx)
+	}
+	return handler
+}
+
+func (handler *MallogEventHandler) notify() {
+	select {
+	case handler.triggerCh <- struct{}{}:
+	default:
 	}
 }
 
-// Start starts the mail log event handler
-func (handler *MallogEventHandler) Start() {
-	_, err := gfsnotify.Add(filepath.Dir(handler.maillogStat.maillogPath), func(event *gfsnotify.Event) {
-		// g.Log().Debug(context.Background(), "MallogEventHandler: catch event", event)
-
-		if event.IsWrite() {
-			// g.Log().Debug(context.Background(), "MallogEventHandler: write event", event)
-			if event.Path == handler.maillogStat.maillogPath {
-				// g.Log().Debug(context.Background(), "Reset timer", event)
-				//if !handler.timer.Stop() {
-				//	<-handler.timer.C
-				//}
-				if !handler.isHanding {
-					handler.isHanding = true
-					handler.timer.Reset(handler.delay)
-				}
-			}
-		}
-
-		//if event.IsRename() {
-		//	g.Log().Debug(context.Background(), "MallogEventHandler: rename event", event)
-		//}
-	})
-
-	if err != nil {
-		g.Log().Error(context.Background(), "MallogEventHandler: error adding file watcher", err)
+func stopAndDrainTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
 		return
 	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}
 
-	g.Log().Debug(context.Background(), "MallogEventHandler: start event")
+// Start starts the mail log event handler. File events provide low latency,
+// while polling guarantees progress after log rotation or watcher failure.
+func (handler *MallogEventHandler) Start(ctx context.Context) {
+	if err := handler.watch(handler.notify); err != nil {
+		g.Log().Error(ctx, "MallogEventHandler: error adding file watcher", err)
+	}
+
+	g.Log().Debug(ctx, "MallogEventHandler: start event")
+	pollTicker := time.NewTicker(handler.pollInterval)
+	defer pollTicker.Stop()
+
+	debounceTimer := time.NewTimer(handler.delay)
+	stopAndDrainTimer(debounceTimer)
+	defer stopAndDrainTimer(debounceTimer)
+	var debounceC <-chan time.Time
+
+	runAnalysis := func() {
+		if err := handler.analyze(ctx); err != nil {
+			g.Log().Error(ctx, "MallogEventHandler: error analysing maillog", err)
+		}
+	}
+
+	// Register the watcher first, then scan immediately. Any event received
+	// during the scan remains buffered and is handled after it completes.
+	runAnalysis()
 
 	for {
 		select {
-		case <-handler.timer.C:
-			handler.isHanding = false
-			g.Log().Debug(context.Background(), "MallogEventHandler: timer event")
-			handler.maillogStat.startTime = GetLastMaillogTimeMillis()
-			if err = handler.maillogStat.AnalysisAndSaveToDatabase(context.Background()); err != nil {
-				g.Log().Error(context.Background(), "MallogEventHandler: error analysing maillog", err)
-			}
+		case <-ctx.Done():
+			return
+		case <-handler.triggerCh:
+			stopAndDrainTimer(debounceTimer)
+			debounceTimer.Reset(handler.delay)
+			debounceC = debounceTimer.C
+		case <-debounceC:
+			debounceC = nil
+			runAnalysis()
+		case <-pollTicker.C:
+			runAnalysis()
 		}
 	}
 }

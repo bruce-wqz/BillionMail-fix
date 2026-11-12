@@ -1,7 +1,12 @@
 package maillog_stat
 
 import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,10 +151,184 @@ func TestParseLogTimeMillis_ISO8601(t *testing.T) {
 	ms := newTestMaillogStat()
 
 	result := ms.parseLogTimeMillis("2024-01-15T10:30:00Z hostname postfix/smtp[1234]: message")
-	if result > 0 {
-		expectedTime, _ := time.Parse(time.RFC3339, "2024-01-15T10:30:00Z")
-		assert.Equal(t, expectedTime.UnixMilli(), result)
+	expectedTime, err := time.Parse(time.RFC3339, "2024-01-15T10:30:00Z")
+	require.NoError(t, err)
+	assert.Equal(t, expectedTime.UnixMilli(), result)
+}
+
+func TestParseLogTimeMillis_ISO8601FractionalTimezone(t *testing.T) {
+	ms := newTestMaillogStat()
+	value := "2026-11-12T09:19:53.287703+08:00"
+
+	result := ms.parseLogTimeMillis(value + " postfix postfix/qmgr[1234]: message")
+	expectedTime, err := time.Parse(time.RFC3339Nano, value)
+	require.NoError(t, err)
+	assert.Equal(t, expectedTime.UnixMilli(), result)
+}
+
+func newTestMallogEventHandler(
+	delay time.Duration,
+	pollInterval time.Duration,
+	watch func(notify func()) error,
+	analyze func(context.Context) error,
+) *MallogEventHandler {
+	return &MallogEventHandler{
+		delay:        delay,
+		pollInterval: pollInterval,
+		triggerCh:    make(chan struct{}, 1),
+		watch:        watch,
+		analyze:      analyze,
 	}
+}
+
+func waitForAnalysisCount(t *testing.T, count *atomic.Int32, expected int32) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return count.Load() >= expected
+	}, time.Second, 5*time.Millisecond)
+}
+
+func TestMallogEventHandlerCoalescesEventsAndStopsWithContext(t *testing.T) {
+	var count atomic.Int32
+	notifyReady := make(chan func(), 1)
+	handler := newTestMallogEventHandler(
+		15*time.Millisecond,
+		time.Hour,
+		func(notify func()) error {
+			notifyReady <- notify
+			return nil
+		},
+		func(context.Context) error {
+			count.Add(1)
+			return nil
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.Start(ctx)
+	}()
+
+	notify := <-notifyReady
+	waitForAnalysisCount(t, &count, 1)
+	notify()
+	notify()
+	notify()
+	waitForAnalysisCount(t, &count, 2)
+	time.Sleep(40 * time.Millisecond)
+	assert.Equal(t, int32(2), count.Load())
+
+	cancel()
+	require.Eventually(t, func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 5*time.Millisecond)
+}
+
+func TestMallogEventHandlerRetainsEventDuringAnalysis(t *testing.T) {
+	var count atomic.Int32
+	notifyReady := make(chan func(), 1)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	handler := newTestMallogEventHandler(
+		10*time.Millisecond,
+		time.Hour,
+		func(notify func()) error {
+			notifyReady <- notify
+			return nil
+		},
+		func(context.Context) error {
+			if count.Add(1) == 1 {
+				close(firstStarted)
+				<-releaseFirst
+			}
+			return nil
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.Start(ctx)
+	}()
+
+	notify := <-notifyReady
+	<-firstStarted
+	notify()
+	close(releaseFirst)
+	waitForAnalysisCount(t, &count, 2)
+	cancel()
+	<-done
+}
+
+func TestMallogEventHandlerPollsWhenWatcherFails(t *testing.T) {
+	var count atomic.Int32
+	handler := newTestMallogEventHandler(
+		10*time.Millisecond,
+		15*time.Millisecond,
+		func(func()) error { return errors.New("watch unavailable") },
+		func(context.Context) error {
+			count.Add(1)
+			return nil
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.Start(ctx)
+	}()
+
+	waitForAnalysisCount(t, &count, 2)
+	cancel()
+	<-done
+}
+
+func TestMallogEventHandlerHandlesLogRotation(t *testing.T) {
+	tempDir := t.TempDir()
+	maillogPath := filepath.Join(tempDir, "mail.log")
+	require.NoError(t, os.WriteFile(maillogPath, []byte("initial\n"), 0o640))
+
+	var count atomic.Int32
+	handler := newTestMallogEventHandler(
+		15*time.Millisecond,
+		time.Hour,
+		func(notify func()) error { return watchMaillog(maillogPath, notify) },
+		func(context.Context) error {
+			count.Add(1)
+			return nil
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.Start(ctx)
+	}()
+	waitForAnalysisCount(t, &count, 1)
+
+	file, err := os.OpenFile(maillogPath, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = file.WriteString("write\n")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	waitForAnalysisCount(t, &count, 2)
+
+	require.NoError(t, os.Rename(maillogPath, maillogPath+".1"))
+	require.NoError(t, os.WriteFile(maillogPath, []byte("rotated\n"), 0o640))
+	waitForAnalysisCount(t, &count, 3)
+
+	cancel()
+	<-done
 }
 
 func TestAnalyzeLine_SendMail(t *testing.T) {
